@@ -62,6 +62,30 @@
   const counter = document.getElementById('counter');
   document.getElementById('download').href = file;
 
+  // ===== Statistiques (GoatCounter, sans cookies) =====
+  // Tableau de bord : https://apsaintjosephuccle.goatcounter.com
+  const GC_ACCOUNT = 'apsaintjosephuccle';
+  const issue = file.replace(/\.pdf$/i, '');
+  const gcQueue = [];
+  function stat(path, title, isEvent){
+    const data = { path: path, title: title, event: !!isEvent };
+    if (window.goatcounter && window.goatcounter.count) window.goatcounter.count(data);
+    else gcQueue.push(data);
+  }
+  window.goatcounter = { no_onload: true, allow_frame: true };
+  const gc = document.createElement('script');
+  gc.async = true;
+  gc.src = 'https://gc.zgo.at/count.js';
+  gc.dataset.goatcounter = 'https://' + GC_ACCOUNT + '.goatcounter.com/count';
+  gc.onload = () => { while (gcQueue.length) window.goatcounter.count(gcQueue.shift()); };
+  document.head.appendChild(gc);
+
+  // Une ouverture du magazine (pas comptée si c'est l'onglet "plein écran")
+  if (!params.has('fs')) stat('/' + issue, 'Magazine – ' + issue, false);
+
+  document.getElementById('download').addEventListener('click', () =>
+    stat(issue + ' – téléchargé', 'Téléchargement ' + issue, true));
+
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
@@ -155,7 +179,18 @@
     } else {
       counter.textContent = (i + 1) + ' / ' + n;
     }
+    // Jusqu'où les lecteurs vont-ils ? (25 %, 50 %, 75 %, fin)
+    const seen = (dbl && i > 0) ? Math.min(i + 2, n) : i + 1;
+    const pct = seen / n * 100;
+    [25, 50, 75, 100].forEach(m => {
+      if (pct >= m && !reached[m]) {
+        reached[m] = true;
+        const label = m === 100 ? 'lu jusqu\'à la fin' : 'lu à ' + m + ' %';
+        stat(issue + ' – ' + label, 'Lecture ' + issue + ' ' + m + '%', true);
+      }
+    });
   }
+  const reached = {};
 
   build();
   loading.style.display = 'none';
@@ -177,10 +212,12 @@
   document.getElementById('full').onclick = () => {
     const el = document.documentElement;
     if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    stat(issue + ' – plein écran', 'Plein écran ' + issue, true);
+    const fsUrl = location.href + (location.search ? '&' : '?') + 'fs=1';
     if (el.requestFullscreen && document.fullscreenEnabled) {
-      el.requestFullscreen().catch(() => window.open(location.href, '_blank'));
+      el.requestFullscreen().catch(() => window.open(fsUrl, '_blank'));
     } else {
-      window.open(location.href, '_blank');
+      window.open(fsUrl, '_blank');
     }
   };
 })();
