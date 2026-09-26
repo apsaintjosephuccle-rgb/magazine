@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magazine – École Saint-Joseph Uccle</title>
+<style>
+  /* ===== Couleurs : modifiez ici si besoin ===== */
+  :root{
+    --bg:#f4f1ec;      /* fond autour du magazine */
+    --bar:#1f2a44;     /* barre d'outils */
+    --txt:#ffffff;     /* texte de la barre */
+    --accent:#c8a24a;  /* barre de chargement */
+  }
+  html,body{margin:0;height:100%;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #stage{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:12px;box-sizing:border-box}
+  #bookBox{margin:0 auto}
+  #bar{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;background:var(--bar);color:var(--txt);padding:8px}
+  #bar button,#bar a{background:transparent;border:1px solid rgba(255,255,255,.4);color:var(--txt);padding:6px 12px;border-radius:6px;font-size:14px;cursor:pointer;text-decoration:none;font-family:inherit}
+  #bar button:hover,#bar a:hover{background:rgba(255,255,255,.15)}
+  #counter{min-width:90px;text-align:center;font-size:14px}
+  #loading{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#333;font-size:15px}
+  .progress{width:220px;height:6px;background:#ddd;border-radius:3px;overflow:hidden}
+  .progress div{height:100%;width:0;background:var(--accent);transition:width .2s}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <div id="loading">
+      <div id="loadText">Chargement du magazine…</div>
+      <div class="progress"><div id="progressBar"></div></div>
+    </div>
+    <div id="bookBox"><div id="book"></div></div>
+  </div>
+  <div id="bar">
+    <button id="prev" aria-label="Page précédente">◀</button>
+    <span id="counter">–</span>
+    <button id="next" aria-label="Page suivante">▶</button>
+    <button id="full">⛶ Plein écran</button>
+    <a id="download" download>⬇ Télécharger</a>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js"></script>
+<script>
+(async function(){
+  // Quel PDF afficher ? Par défaut "magazine.pdf".
+  // Pour un autre numéro : index.html?pdf=juin-2026.pdf
+  const params = new URLSearchParams(location.search);
+  const file = params.get('pdf') || 'magazine.pdf';
+
+  const stage = document.getElementById('stage');
+  const bookBox = document.getElementById('bookBox');
+  const loading = document.getElementById('loading');
+  const loadText = document.getElementById('loadText');
+  const progressBar = document.getElementById('progressBar');
+  const counter = document.getElementById('counter');
+  document.getElementById('download').href = file;
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  let pdf;
+  try {
+    pdf = await pdfjsLib.getDocument(file).promise;
+  } catch (e) {
+    loadText.textContent = 'Impossible de charger « ' + file + ' ».';
+    progressBar.parentNode.style.display = 'none';
+    return;
+  }
+
+  // Transforme chaque page du PDF en image
+  const images = [];
+  let ratio = 0.707;
+  const RENDER_WIDTH = 1100; // netteté des pages (plus grand = plus net mais plus lent)
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    if (i === 1) ratio = base.width / base.height;
+    const viewport = page.getViewport({ scale: RENDER_WIDTH / base.width });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    images.push(canvas.toDataURL('image/jpeg', 0.85));
+    progressBar.style.width = Math.round(i / pdf.numPages * 100) + '%';
+  }
+
+  // Adapte la taille du livre à l'espace disponible
+  function fit(){
+    const w = stage.clientWidth - 24, h = stage.clientHeight - 24;
+    const pages = w >= 700 ? 2 : 1;
+    bookBox.style.width = Math.max(200, Math.min(w, h * ratio * pages)) + 'px';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+
+  const pw = 500, ph = Math.round(500 / ratio);
+  const flip = new St.PageFlip(document.getElementById('book'), {
+    width: pw, height: ph, size: 'stretch',
+    minWidth: 150, maxWidth: 3000, minHeight: 200, maxHeight: 4000,
+    showCover: true, maxShadowOpacity: 0.4, mobileScrollSupport: false
+  });
+  flip.loadFromImages(images);
+  loading.style.display = 'none';
+
+  function update(){
+    counter.textContent = (flip.getCurrentPageIndex() + 1) + ' / ' + flip.getPageCount();
+  }
+  flip.on('flip', update);
+  update();
+
+  document.getElementById('prev').onclick = () => flip.flipPrev();
+  document.getElementById('next').onclick = () => flip.flipNext();
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft') flip.flipPrev();
+    if (e.key === 'ArrowRight') flip.flipNext();
+  });
+
+  // Plein écran (si bloqué par Wix, ouvre dans un nouvel onglet)
+  document.getElementById('full').onclick = () => {
+    const el = document.documentElement;
+    if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    if (el.requestFullscreen && document.fullscreenEnabled) {
+      el.requestFullscreen().catch(() => window.open(location.href, '_blank'));
+    } else {
+      window.open(location.href, '_blank');
+    }
+  };
+})();
+</script>
+</body>
+</html>
