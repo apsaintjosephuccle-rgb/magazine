@@ -1,0 +1,129 @@
+# Publie le site et crée automatiquement une page avec aperçu (couverture)
+# pour chaque PDF. Se lance tout seul à chaque ajout ou modification de fichier.
+name: Publier les publications
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publier:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: pages
+        uses: actions/configure-pages@v6
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Installer les outils
+        run: pip install pymupdf pillow
+
+      - name: Créer les pages et les aperçus
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re, json, html, hashlib, pathlib, urllib.parse
+          import pymupdf as fitz
+          from PIL import Image
+
+          SCHOOL = "École Saint-Joseph Uccle"
+          BG = (31, 42, 68)   # couleur de fond de l'aperçu
+          base = os.environ["BASE_URL"].rstrip("/") + "/"
+
+          # Titres personnalisés (facultatif) : fichier titres.txt
+          #   issue-2 = Magazine n°2 – Automne 2026
+          titles = {}
+          if os.path.exists("titres.txt"):
+              for line in open("titres.txt", encoding="utf-8-sig"):
+                  if "=" in line and not line.strip().startswith("#"):
+                      k, v = line.split("=", 1)
+                      titles[k.strip().lower().removesuffix(".pdf")] = v.strip()
+
+          def pretty(n):
+              t = re.sub(r"[-_]+", " ", n).strip()
+              return t[:1].upper() + t[1:]
+
+          for pdf in sorted(pathlib.Path(".").glob("*.pdf"), key=lambda p: p.name.lower()):
+              name = pdf.stem
+              slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-")
+              if not slug:
+                  continue
+              title = titles.get(name.lower()) or titles.get(slug) or pretty(name)
+              out = pathlib.Path(slug)
+              out.mkdir(exist_ok=True)
+
+              # Image de couverture 1200 x 630
+              try:
+                  doc = fitz.open(pdf)
+                  page = doc[0]
+                  zoom = 630 / page.rect.height
+                  pix = page.get_pixmap(matrix=fitz.Matrix(zoom * 2, zoom * 2))
+                  cover = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                  h = 590
+                  w = round(cover.width * h / cover.height)
+                  if w > 1160:
+                      w = 1160
+                      h = round(cover.height * w / cover.width)
+                  cover = cover.resize((w, h), Image.LANCZOS)
+                  img = Image.new("RGB", (1200, 630), BG)
+                  img.paste(cover, ((1200 - w) // 2, (630 - h) // 2))
+                  img.save(out / "cover.jpg", "JPEG", quality=82, optimize=True)
+              except Exception as e:
+                  print("Aperçu impossible pour", pdf.name, ":", e)
+
+              version = hashlib.md5(pdf.read_bytes()).hexdigest()[:8]
+              desc = "Cliquez pour lire en ligne – " + SCHOOL
+              pub = json.dumps({"name": name, "title": title,
+                                "pdf": "../" + urllib.parse.quote(pdf.name)},
+                               ensure_ascii=False).replace("</", "<\\/")
+              e = lambda s: html.escape(s, quote=True)
+              (out / "index.html").write_text(f"""<!DOCTYPE html>
+          <html lang="fr">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{e(title)} – {e(SCHOOL)}</title>
+          <meta name="description" content="{e(desc)}">
+          <meta property="og:type" content="article">
+          <meta property="og:site_name" content="{e(SCHOOL)}">
+          <meta property="og:title" content="{e(title)}">
+          <meta property="og:description" content="{e(desc)}">
+          <meta property="og:url" content="{e(base + slug)}/">
+          <meta property="og:image" content="{e(base + slug)}/cover.jpg?v={version}">
+          <meta property="og:image:width" content="1200">
+          <meta property="og:image:height" content="630">
+          <meta name="twitter:card" content="summary_large_image">
+          </head>
+          <body>
+          <script>window.PUB = {pub};</script>
+          <script src="../viewer.js"></script>
+          </body>
+          </html>
+          """, encoding="utf-8")
+              print("OK :", pdf.name, "->", base + slug + "/", "|", title)
+          PYTHON
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: '.'
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
