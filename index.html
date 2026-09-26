@@ -15,9 +15,22 @@
   html,body{margin:0;height:100%;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   #wrap{display:flex;flex-direction:column;height:100%}
   #stage{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;box-sizing:border-box;min-height:0}
-  #bookBox{margin:0 auto}
+  #bookBox{margin:0 auto;touch-action:pan-y}
   .page{background:#fff;overflow:hidden}
   .page img{display:block;width:100%;height:100%;object-fit:fill;user-select:none;-webkit-user-drag:none;pointer-events:none}
+
+  /* Liens cliquables */
+  .lnk{position:absolute;display:block;cursor:pointer;border-radius:3px;z-index:3;background:rgba(255,200,0,0);transition:background .15s}
+  .lnk:hover,.lnk:focus-visible{background:rgba(255,200,0,.28);outline:none}
+
+  /* Zoom */
+  #zoom{position:absolute;inset:0;overflow:auto;background:var(--bg);z-index:4;display:flex;cursor:grab;touch-action:pan-x pan-y;-webkit-overflow-scrolling:touch}
+  #zoom[hidden]{display:none}
+  #zoom.drag{cursor:grabbing}
+  #zoomInner{margin:auto;display:flex;padding:10px;flex:none}
+  .zpage{position:relative;background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.18);flex:none}
+  .zpage img{display:block;width:100%;height:100%;user-select:none;-webkit-user-drag:none;pointer-events:none}
+
   #bar{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;background:var(--bar);color:var(--txt);padding:8px}
   #bar button,#bar a{background:transparent;border:1px solid rgba(255,255,255,.4);color:var(--txt);padding:6px 12px;border-radius:6px;font-size:14px;cursor:pointer;text-decoration:none;font-family:inherit}
   #bar button:hover,#bar a:hover{background:rgba(255,255,255,.15)}
@@ -35,11 +48,14 @@
       <div class="progress"><div id="progressBar"></div></div>
     </div>
     <div id="bookBox"></div>
+    <div id="zoom" hidden><div id="zoomInner"></div></div>
   </div>
   <div id="bar">
     <button id="prev" aria-label="Page précédente">◀</button>
     <span id="counter">–</span>
     <button id="next" aria-label="Page suivante">▶</button>
+    <button id="zoomOut" aria-label="Zoom arrière" title="Zoom arrière">🔍−</button>
+    <button id="zoomIn" aria-label="Zoom avant" title="Zoom avant">🔍+</button>
     <button id="full">⛶ Plein écran</button>
     <a id="download" download>⬇ Télécharger</a>
   </div>
@@ -50,12 +66,14 @@
 <script>
 (async function(){
   // Quel PDF afficher ? Par défaut "magazine.pdf".
-  // Pour un autre numéro : ?pdf=juin-2026.pdf
+  // Pour un autre numéro : ?pdf=issue-2.pdf
   const params = new URLSearchParams(location.search);
   const file = params.get('pdf') || 'magazine.pdf';
 
   const stage = document.getElementById('stage');
   const bookBox = document.getElementById('bookBox');
+  const zoomEl = document.getElementById('zoom');
+  const zoomInner = document.getElementById('zoomInner');
   const loading = document.getElementById('loading');
   const loadText = document.getElementById('loadText');
   const progressBar = document.getElementById('progressBar');
@@ -103,13 +121,9 @@
   const longSide = Math.max(screen.width, screen.height);
   const RENDER_WIDTH = Math.min(2200, Math.max(1400, Math.ceil(longSide * dpr * 0.7)));
 
-  const urls = [];
-  let ratio = 0.707;
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
+  async function renderPage(page, width){
     const base = page.getViewport({ scale: 1 });
-    if (i === 1) ratio = base.width / base.height;
-    const viewport = page.getViewport({ scale: RENDER_WIDTH / base.width });
+    const viewport = page.getViewport({ scale: width / base.width });
     const canvas = document.createElement('canvas');
     canvas.width = Math.round(viewport.width);
     canvas.height = Math.round(viewport.height);
@@ -118,14 +132,136 @@
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport }).promise;
     const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.92));
-    urls.push(URL.createObjectURL(blob));
     canvas.width = canvas.height = 0; // libère la mémoire
+    return URL.createObjectURL(blob);
+  }
+
+  // ===== Liens du PDF =====
+  const URL_RE = /((?:https?:\/\/|www\.)[^\s<>"«»]+|(?:forms\.gle|bit\.ly|tinyurl\.com|docs\.google\.com)\/[^\s<>"«»]+)/gi;
+  function cleanUrl(u){ return u.replace(/[.,;:!?)\]}'’]+$/, ''); }
+  function overlaps(a, b){
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  }
+  async function getLinks(page){
+    const out = [];
+    const view = page.view, W = view[2] - view[0], H = view[3] - view[1];
+    // 1) Vrais liens (ajoutés dans Canva, Word, InDesign…)
+    try {
+      const annots = await page.getAnnotations();
+      for (const a of annots) {
+        if (a.subtype !== 'Link' || !a.rect) continue;
+        const r = pdfjsLib.Util.normalizeRect(a.rect);
+        const box = { x: (r[0] - view[0]) / W, y: (view[3] - r[3]) / H, w: (r[2] - r[0]) / W, h: (r[3] - r[1]) / H };
+        const url = a.url || a.unsafeUrl;
+        if (url && /^(https?:|mailto:|tel:)/i.test(url)) { out.push(Object.assign(box, { url })); continue; }
+        if (a.dest) {
+          try {
+            const dest = typeof a.dest === 'string' ? await pdf.getDestination(a.dest) : a.dest;
+            if (dest && dest[0]) {
+              const idx = typeof dest[0] === 'number' ? dest[0] : await pdf.getPageIndex(dest[0]);
+              out.push(Object.assign(box, { page: idx }));
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    // 2) Adresses écrites en texte (www…, https://…, forms.gle/…)
+    try {
+      const base = page.getViewport({ scale: 1 });
+      const tc = await page.getTextContent();
+      for (const item of tc.items) {
+        const str = item.str;
+        if (!str || !/(https?:|www\.|forms\.gle|bit\.ly|tinyurl|docs\.google)/i.test(str)) continue;
+        const t = pdfjsLib.Util.transform(base.transform, item.transform);
+        if (Math.abs(t[1]) > 0.01 || Math.abs(t[2]) > 0.01) continue; // texte horizontal seulement
+        const fontH = Math.hypot(t[2], t[3]);
+        const charW = item.width / str.length;
+        let m;
+        URL_RE.lastIndex = 0;
+        while ((m = URL_RE.exec(str))) {
+          const txt = cleanUrl(m[0]);
+          const box = {
+            x: (t[4] + m.index * charW) / base.width,
+            y: (t[5] - fontH) / base.height,
+            w: (txt.length * charW) / base.width,
+            h: (fontH * 1.25) / base.height
+          };
+          if (out.some(o => overlaps(o, box))) continue;
+          box.url = /^https?:/i.test(txt) ? txt : 'https://' + txt;
+          out.push(box);
+        }
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  const urls = [];
+  const links = [];
+  let ratio = 0.707;
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    if (i === 1) ratio = base.width / base.height;
+    urls.push(await renderPage(page, RENDER_WIDTH));
+    links.push(await getLinks(page));
     progressBar.style.width = Math.round(i / pdf.numPages * 100) + '%';
   }
 
   let flip = null;
   let current = 0;
   let lastMode = '';
+  let pageW = 300, pageH = 424;
+
+  function addLinks(container, pageIndex){
+    (links[pageIndex] || []).forEach(l => {
+      const a = document.createElement('a');
+      a.className = 'lnk';
+      a.style.left = (l.x * 100) + '%';
+      a.style.top = (l.y * 100) + '%';
+      a.style.width = (l.w * 100) + '%';
+      a.style.height = (l.h * 100) + '%';
+      if (l.url) {
+        a.href = l.url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.title = l.url;
+        a.addEventListener('click', e => {
+          e.stopPropagation();
+          let host = l.url;
+          try { host = new URL(l.url).hostname.replace(/^www\./, ''); } catch (err) {}
+          stat(issue + ' – lien : ' + host, 'Lien ' + issue, true);
+        });
+      } else {
+        a.href = '#';
+        a.title = 'Aller à la page ' + (l.page + 1);
+        a.addEventListener('click', e => {
+          e.preventDefault(); e.stopPropagation();
+          goToPage(l.page);
+        });
+      }
+      ['mousedown', 'touchstart', 'pointerdown'].forEach(ev =>
+        a.addEventListener(ev, e => e.stopPropagation(), { passive: true }));
+      container.appendChild(a);
+    });
+  }
+
+  // Page précédente (contourne un défaut de la bibliothèque en mode une page)
+  function goPrev(){ if (flip) flip.flipPrev(); }
+  function fixPrev(f){
+    const orig = f.flipPrev.bind(f);
+    f.flipPrev = corner => {      // utilisé aussi par le glissement du doigt
+      if (f.getOrientation() !== 'portrait') return orig(corner);
+      if (f.getCurrentPageIndex() === 0) return;
+      const r = f.getRender().getRect();
+      f.getFlipController().flip({ x: r.left + 10, y: corner === 'bottom' ? r.height - 2 : 1 });
+    };
+  }
+  function goToPage(p){
+    closeZoom();
+    if (flip.getOrientation() === 'portrait' && p < flip.getCurrentPageIndex()) {
+      flip.turnToPage(p); update();
+    } else flip.flip(p);
+  }
 
   function isMobile(){
     const w = stage.clientWidth, h = stage.clientHeight;
@@ -136,9 +272,8 @@
     const w = stage.clientWidth - 20, h = stage.clientHeight - 20;
     const single = isMobile();
     const pages = single ? 1 : 2;
-    let pageW = Math.min(w / pages, h * ratio);
-    pageW = Math.max(120, Math.floor(pageW));
-    const pageH = Math.floor(pageW / ratio);
+    pageW = Math.max(120, Math.floor(Math.min(w / pages, h * ratio)));
+    pageH = Math.floor(pageW / ratio);
 
     if (flip) { current = flip.getCurrentPageIndex(); flip.destroy(); }
     bookBox.innerHTML = '';
@@ -154,6 +289,7 @@
       img.src = u;
       img.alt = 'Page ' + (i + 1);
       p.appendChild(img);
+      addLinks(p, i);
       book.appendChild(p);
     });
     bookBox.appendChild(book);
@@ -162,25 +298,30 @@
       width: pageW, height: pageH, size: 'fixed',
       showCover: !single, usePortrait: true,
       maxShadowOpacity: 0.4, mobileScrollSupport: false,
-      startPage: current, flippingTime: 700
+      startPage: current, flippingTime: 700,
+      disableFlipByClick: true   // le clic est géré plus bas (simple = tourner, double = zoom)
     });
     flip.loadFromHTML(book.querySelectorAll('.page'));
-    flip.on('flip', update);
-    update();
+    fixPrev(flip);
+    flip.on('flip', () => { update(); if (!zoomEl.hidden) renderZoomPages(); });
     lastMode = single ? 'single' : 'double';
+    update();
+    if (!zoomEl.hidden) renderZoomPages();
   }
 
+  function visiblePages(){
+    const i = flip.getCurrentPageIndex(), n = flip.getPageCount();
+    return (lastMode === 'double' && i > 0 && i < n - 1) ? [i, i + 1] : [i];
+  }
+
+  const reached = {};
   function update(){
     if (!flip) return;
     const i = flip.getCurrentPageIndex(), n = flip.getPageCount();
-    const dbl = lastMode === 'double' || !isMobile();
-    if (dbl && i > 0 && i < n - 1) {
-      counter.textContent = (i + 1) + '–' + Math.min(i + 2, n) + ' / ' + n;
-    } else {
-      counter.textContent = (i + 1) + ' / ' + n;
-    }
+    const vp = visiblePages();
+    counter.textContent = vp.length === 2 ? (i + 1) + '–' + (i + 2) + ' / ' + n : (i + 1) + ' / ' + n;
     // Jusqu'où les lecteurs vont-ils ? (25 %, 50 %, 75 %, fin)
-    const seen = (dbl && i > 0) ? Math.min(i + 2, n) : i + 1;
+    const seen = vp[vp.length - 1] + 1;
     const pct = seen / n * 100;
     [25, 50, 75, 100].forEach(m => {
       if (pct >= m && !reached[m]) {
@@ -190,7 +331,236 @@
       }
     });
   }
-  const reached = {};
+
+  // ===== ZOOM =====
+  const MAX_ZOOM = 4, STEP = 1.5;
+  let zoom = 1;
+  let zoomStatSent = false;
+  const hiRes = {};        // page -> { w, url }
+  const hiResOrder = [];
+
+  function renderZoomPages(){
+    zoomInner.innerHTML = '';
+    visiblePages().forEach(p => {
+      const d = document.createElement('div');
+      d.className = 'zpage';
+      d.dataset.page = p;
+      const img = document.createElement('img');
+      img.src = (hiRes[p] && hiRes[p].url) || urls[p];
+      img.alt = 'Page ' + (p + 1);
+      d.appendChild(img);
+      addLinks(d, p);
+      zoomInner.appendChild(d);
+    });
+    sizeZoomPages();
+  }
+
+  function sizeZoomPages(){
+    zoomInner.querySelectorAll('.zpage').forEach(d => {
+      d.style.width = Math.round(pageW * zoom) + 'px';
+      d.style.height = Math.round(pageH * zoom) + 'px';
+    });
+    upgradeSharpness();
+  }
+
+  let sharpTimer;
+  function upgradeSharpness(){
+    clearTimeout(sharpTimer);
+    sharpTimer = setTimeout(async () => {
+      const need = pageW * zoom * dpr;
+      if (need <= RENDER_WIDTH * 1.15) return;
+      const target = Math.min(4000, Math.ceil(need / 500) * 500);
+      for (const d of zoomInner.querySelectorAll('.zpage')) {
+        const p = +d.dataset.page;
+        if (!hiRes[p] || hiRes[p].w < target) {
+          const page = await pdf.getPage(p + 1);
+          const url = await renderPage(page, target);
+          if (hiRes[p]) URL.revokeObjectURL(hiRes[p].url);
+          hiRes[p] = { w: target, url };
+          hiResOrder.push(p);
+          while (hiResOrder.length > 6) {
+            const old = hiResOrder.shift();
+            if (hiRes[old] && !hiResOrder.includes(old)) { URL.revokeObjectURL(hiRes[old].url); delete hiRes[old]; }
+          }
+        }
+        const img = d.querySelector('img');
+        if (img && hiRes[p]) img.src = hiRes[p].url;
+      }
+    }, 250);
+  }
+
+  // Point fixe pendant le zoom : (cx, cy) dans la fenêtre de zoom, (u, v) dans le contenu
+  function contentFrac(cx, cy){
+    const r = zoomInner.getBoundingClientRect(), c = zoomEl.getBoundingClientRect();
+    return { u: (c.left + cx - r.left) / r.width, v: (c.top + cy - r.top) / r.height };
+  }
+  function setZoom(level, cx, cy, u, v){
+    level = Math.min(MAX_ZOOM, Math.max(1, level));
+    const opening = zoomEl.hidden;
+    if (opening) {
+      zoomEl.hidden = false;
+      renderZoomPages();
+      if (!zoomStatSent) { zoomStatSent = true; stat(issue + ' – zoom', 'Zoom ' + issue, true); }
+    }
+    if (cx === undefined) { cx = zoomEl.clientWidth / 2; cy = zoomEl.clientHeight / 2; }
+    if (u === undefined) { const f = contentFrac(cx, cy); u = f.u; v = f.v; }
+    zoom = level;
+    sizeZoomPages();
+    const r = zoomInner.getBoundingClientRect(), c = zoomEl.getBoundingClientRect();
+    zoomEl.scrollLeft += (r.left + u * r.width) - (c.left + cx);
+    zoomEl.scrollTop  += (r.top + v * r.height) - (c.top + cy);
+  }
+  function closeZoom(){
+    if (zoomEl.hidden) return;
+    zoomEl.hidden = true;
+    zoom = 1;
+    zoomInner.innerHTML = '';
+  }
+  function zoomIn(){ setZoom(zoomEl.hidden ? STEP : zoom * STEP); }
+  function zoomOut(){
+    if (zoomEl.hidden) return;
+    const next = zoom / STEP;
+    if (next < 1.05) closeZoom(); else setZoom(next);
+  }
+
+  // Ouvre le zoom à l'endroit cliqué sur le livre
+  function zoomAtBookPoint(clientX, clientY, level){
+    const b = bookBox.getBoundingClientRect();
+    let u = (clientX - b.left) / b.width, v = (clientY - b.top) / b.height;
+    const vp = visiblePages();
+    if (lastMode === 'double' && vp.length === 1) {
+      u = flip.getCurrentPageIndex() === 0 ? (u - 0.5) * 2 : u * 2; // couverture seule
+    }
+    u = Math.min(1, Math.max(0, u)); v = Math.min(1, Math.max(0, v));
+    zoomEl.hidden = false;
+    zoom = 1;
+    renderZoomPages();
+    const c = zoomEl.getBoundingClientRect();
+    setZoom(level, clientX - c.left, clientY - c.top, u, v);
+  }
+
+  // Clic simple = tourner la page ; double clic / double tap = zoom
+  let downX = 0, downY = 0, clickTimer = null, lastClick = 0, lastTouch = 0;
+  bookBox.addEventListener('pointerdown', e => { downX = e.clientX; downY = e.clientY; });
+  bookBox.addEventListener('click', e => {
+    if (e.target.closest('a')) return;
+    if (Date.now() - lastTouch < 800) return;   // les touchers sont gérés plus bas
+    if (Math.hypot(e.clientX - downX, e.clientY - downY) > 8) return; // c'était un glissement
+    if (flip.getState() === 'flipping') return;                        // coin déjà tourné
+    const now = Date.now();
+    if (clickTimer && now - lastClick < 320) {
+      clearTimeout(clickTimer); clickTimer = null;
+      zoomAtBookPoint(e.clientX, e.clientY, 2);
+      return;
+    }
+    lastClick = now;
+    const x = e.clientX, b = bookBox.getBoundingClientRect();
+    clickTimer = setTimeout(() => {
+      clickTimer = null;
+      if (flip.getState() !== 'read') return;
+      if (x < b.left + b.width / 2) goPrev(); else flip.flipNext();
+    }, 320);
+  });
+
+  // Double clic / double tap dans le zoom = revenir au magazine
+  let zLast = 0;
+  zoomEl.addEventListener('click', e => {
+    if (e.target.closest('a') || dragMoved) return;
+    const now = Date.now();
+    if (now - zLast < 320) { zLast = 0; closeZoom(); } else zLast = now;
+  });
+
+  // Glisser avec la souris pour se déplacer dans la page zoomée
+  let dragging = false, dragMoved = false, sx = 0, sy = 0, sl = 0, st = 0;
+  zoomEl.addEventListener('mousedown', e => {
+    if (e.button !== 0 || e.target.closest('a')) return;
+    dragging = true; dragMoved = false;
+    sx = e.clientX; sy = e.clientY; sl = zoomEl.scrollLeft; st = zoomEl.scrollTop;
+    zoomEl.classList.add('drag');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 4) dragMoved = true;
+    zoomEl.scrollLeft = sl - (e.clientX - sx);
+    zoomEl.scrollTop = st - (e.clientY - sy);
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false; zoomEl.classList.remove('drag');
+    setTimeout(() => { dragMoved = false; }, 0);
+  });
+
+  // Molette + Ctrl (ou pincement du pavé tactile) pour zoomer
+  stage.addEventListener('wheel', e => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    const factor = Math.exp(-e.deltaY * 0.01);
+    if (zoomEl.hidden) {
+      if (factor > 1) zoomAtBookPoint(e.clientX, e.clientY, Math.max(1.2, factor));
+      return;
+    }
+    const c = zoomEl.getBoundingClientRect();
+    const next = zoom * factor;
+    if (next < 1.02) closeZoom(); else setZoom(next, e.clientX - c.left, e.clientY - c.top);
+  }, { passive: false });
+
+  // Pincer avec deux doigts (téléphone / tablette)
+  let pinch = null;
+  function dist(t){ return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY); }
+  stage.addEventListener('touchstart', e => {
+    if (e.touches.length !== 2) return;
+    e.stopPropagation(); e.preventDefault();
+    const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    if (zoomEl.hidden) zoomAtBookPoint(mx, my, 1);
+    const c = zoomEl.getBoundingClientRect();
+    const f = contentFrac(mx - c.left, my - c.top);
+    pinch = { d0: dist(e.touches), z0: zoom, u: f.u, v: f.v };
+  }, { capture: true, passive: false });
+  stage.addEventListener('touchmove', e => {
+    if (!pinch || e.touches.length !== 2) return;
+    e.stopPropagation(); e.preventDefault();
+    const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    const c = zoomEl.getBoundingClientRect();
+    setZoom(pinch.z0 * dist(e.touches) / pinch.d0, mx - c.left, my - c.top, pinch.u, pinch.v);
+  }, { capture: true, passive: false });
+  stage.addEventListener('touchend', e => {
+    if (!pinch || e.touches.length >= 2) return;
+    pinch = null;
+    if (zoom < 1.1) closeZoom();
+  }, { capture: true });
+
+  // Double tap sur téléphone (sans passer par le clic du navigateur)
+  let tapT = 0, tapX = 0, tapY = 0, tapStartX = 0, tapStartY = 0, tapMulti = false, tapTimer = null;
+  bookBox.addEventListener('touchstart', e => {
+    tapMulti = e.touches.length > 1;
+    tapStartX = e.touches[0].clientX; tapStartY = e.touches[0].clientY;
+  }, { passive: true });
+  bookBox.addEventListener('touchend', e => {
+    if (tapMulti || e.target.closest('a')) return;
+    const t = e.changedTouches[0];
+    if (Math.hypot(t.clientX - tapStartX, t.clientY - tapStartY) > 10) return;
+    lastTouch = Date.now();
+    if (flip.getState() === 'flipping') return;
+    const now = Date.now();
+    if (now - tapT < 320 && Math.hypot(t.clientX - tapX, t.clientY - tapY) < 40) {
+      tapT = 0;
+      clearTimeout(tapTimer); tapTimer = null;
+      e.preventDefault();
+      zoomAtBookPoint(t.clientX, t.clientY, 2);
+    } else {
+      tapT = now; tapX = t.clientX; tapY = t.clientY;
+      const x = t.clientX, b = bookBox.getBoundingClientRect();
+      clearTimeout(tapTimer);
+      tapTimer = setTimeout(() => {
+        tapTimer = null;
+        if (flip.getState() !== 'read') return;
+        if (x < b.left + b.width / 2) goPrev(); else flip.flipNext();
+      }, 320);
+    }
+  }, { passive: false });
 
   build();
   loading.style.display = 'none';
@@ -201,11 +571,16 @@
     t = setTimeout(build, 250);
   });
 
-  document.getElementById('prev').onclick = () => flip.flipPrev();
+  document.getElementById('prev').onclick = () => goPrev();
   document.getElementById('next').onclick = () => flip.flipNext();
+  document.getElementById('zoomIn').onclick = zoomIn;
+  document.getElementById('zoomOut').onclick = zoomOut;
   document.addEventListener('keydown', e => {
-    if (e.key === 'ArrowLeft') flip.flipPrev();
+    if (e.key === 'ArrowLeft') goPrev();
     if (e.key === 'ArrowRight') flip.flipNext();
+    if (e.key === '+' || e.key === '=') zoomIn();
+    if (e.key === '-') zoomOut();
+    if (e.key === 'Escape') closeZoom();
   });
 
   // Plein écran (si bloqué par Wix, ouvre dans un nouvel onglet)
